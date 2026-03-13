@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: rocade
+    env: node
+    rootDir: rocade-react
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: rocade-data
+      mountPath: /var/data
+      sizeGB: 1
