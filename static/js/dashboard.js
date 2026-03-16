@@ -81,6 +81,10 @@
         let searchQuery = '';
         let showActiveAislesOnly = false;
 
+        const STORAGE_DATA_KEY = 'rocade_app_data_v1';
+        const STORAGE_UI_KEY = 'rocade_app_ui_v1';
+        const IS_STATIC_DEPLOY = window.location.hostname.endsWith('github.io') || window.location.protocol === 'file:';
+
         let syncTimer = null;
 
         function scheduleSync() {
@@ -102,6 +106,12 @@
                 })
             };
 
+            if (IS_STATIC_DEPLOY) {
+                localStorage.setItem(STORAGE_DATA_KEY, payload.data);
+                localStorage.setItem(STORAGE_UI_KEY, payload.uiState);
+                return;
+            }
+
             try {
                 const response = await fetch('/api/rocade/state', {
                     method: 'PUT',
@@ -122,10 +132,46 @@
         }
 
         async function loadFromServer() {
+            const tryLoadFromLocal = () => {
+                try {
+                    const localData = localStorage.getItem(STORAGE_DATA_KEY);
+                    const localUiState = localStorage.getItem(STORAGE_UI_KEY);
+                    if (!localData || !localUiState) {
+                        return false;
+                    }
+
+                    appData = JSON.parse(localData);
+                    ensureCop7RequestedRows();
+                    ensureCop7MainLtrOrderFromDetailedRows();
+                    const state = JSON.parse(localUiState);
+
+                    if (state.currentRoom && state.currentAisle && state.screen === 'manager') {
+                        currentRoom = state.currentRoom;
+                        selectRoom(currentRoom);
+                        setTimeout(() => selectAisle(state.currentAisle), 100);
+                        return true;
+                    }
+
+                    if (state.currentRoom && state.screen === 'aisle-selection') {
+                        currentRoom = state.currentRoom;
+                        selectRoom(currentRoom);
+                        return true;
+                    }
+                } catch (err) {
+                    console.error('Erreur de chargement local:', err);
+                }
+
+                return false;
+            };
+
+            if (IS_STATIC_DEPLOY) {
+                return tryLoadFromLocal();
+            }
+
             try {
                 const response = await fetch('/api/rocade/state');
                 if (!response.ok) {
-                    return false;
+                    return tryLoadFromLocal();
                 }
 
                 const payload = await response.json();
@@ -157,7 +203,7 @@
                 console.error('Erreur de chargement serveur:', err);
             }
 
-            return false;
+            return tryLoadFromLocal();
         }
 
         async function init() {
@@ -1834,6 +1880,14 @@
 
         async function resetData() {
             if (!confirm("Êtes-vous sûr de vouloir réinitialiser toutes les données ? Cette action est irréversible.")) return;
+
+            if (IS_STATIC_DEPLOY) {
+                localStorage.removeItem(STORAGE_DATA_KEY);
+                localStorage.removeItem(STORAGE_UI_KEY);
+                location.reload();
+                return;
+            }
+
             try {
                 const response = await fetch('/api/rocade/state', { method: 'DELETE' });
                 if (!response.ok) {
