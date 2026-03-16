@@ -1,14 +1,16 @@
 import sqlite3
 import json
 import hashlib
+import os
 from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, g, jsonify, render_template, request
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "rocade.sqlite3"
-AUTO_BACKUP_DIR = BASE_DIR / "backups" / "auto"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
+DB_PATH = DATA_DIR / "rocade.sqlite3"
+AUTO_BACKUP_DIR = DATA_DIR / "backups" / "auto"
 AUTO_BACKUP_META_PATH = AUTO_BACKUP_DIR / "_meta.json"
 AUTO_BACKUP_MIN_INTERVAL_SECONDS = 120
 AUTO_BACKUP_KEEP_FILES = 200
@@ -94,6 +96,7 @@ def close_db(error):
 
 
 def init_db() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB_PATH)
     db.executescript(
         """
@@ -196,6 +199,10 @@ def dashboard():
     return render_template("dashboard.html")
 
 
+init_db()
+
+
 if __name__ == "__main__":
-    init_db()
-    app.run(debug=True)
+    port = int(os.getenv("PORT", "5000"))
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=port, debug=debug)
