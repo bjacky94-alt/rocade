@@ -78,11 +78,8 @@
         let currentRoom = null;
         let currentAisle = null;
         let currentTab = 'all';
-        let currentTypeFilter = 'all';
         let searchQuery = '';
-        let draggedItem = null;
         let showActiveAislesOnly = false;
-        let aisleSortMode = 'load';
 
         let syncTimer = null;
 
@@ -137,6 +134,11 @@
                 }
 
                 appData = JSON.parse(payload.data);
+                const wasNormalized = ensureCop7RequestedRows();
+                const wasAligned = ensureCop7MainLtrOrderFromDetailedRows();
+                if (wasNormalized || wasAligned) {
+                    await syncStateToServer();
+                }
                 const state = JSON.parse(payload.uiState);
 
                 if (state.currentRoom && state.currentAisle && state.screen === 'manager') {
@@ -161,6 +163,11 @@
         async function init() {
             const restored = await loadFromServer();
             if (!restored) {
+                const wasNormalized = ensureCop7RequestedRows();
+                const wasAligned = ensureCop7MainLtrOrderFromDetailedRows();
+                if (wasNormalized || wasAligned) {
+                    await syncStateToServer();
+                }
                 showRoomSelection();
             }
         }
@@ -228,13 +235,313 @@
             return { type, emplacement };
         }
 
+        function normalizeEmplacementToken(token) {
+            const clean = (token || '').trim().toUpperCase();
+            const match = clean.match(/^([A-Z]+)?(\d+)$/);
+            if (!match) return clean;
+
+            const prefix = match[1] || '';
+            const number = String(parseInt(match[2], 10));
+            return `${prefix}${number}`;
+        }
+
         function formatRowName(type, emplacement) {
             const cleanType = (type || '').toUpperCase();
             const cleanEmplacement = (emplacement || '').trim().toUpperCase();
             return cleanEmplacement ? `Rangée ${cleanType}-${cleanEmplacement}` : `Rangée ${cleanType}`;
         }
 
+        function computeRowsStats(rows) {
+            let totalPorts = 0;
+            let activePorts = 0;
+
+            rows.forEach(row => {
+                row.panels.forEach(panel => {
+                    totalPorts += panel.ports.length;
+                    activePorts += panel.ports.filter(p => p.active).length;
+                });
+            });
+
+            const utilization = totalPorts > 0 ? Math.round((activePorts / totalPorts) * 100) : 0;
+            return { totalPorts, activePorts, utilization };
+        }
+
+        function ensureLtiVirtualRows(room) {
+            if (!room) return [];
+            if (Array.isArray(room.ltiVirtualRows) && room.ltiVirtualRows.length === 4) {
+                return room.ltiVirtualRows;
+            }
+
+            const groupedPanels = { 1: [], 2: [], 3: [], 4: [] };
+
+            room.aisles.forEach(aisle => {
+                aisle.rows.forEach(row => {
+                    const identity = parseRowIdentity(row.name);
+                    if (identity.type !== 'LTI') return;
+
+                    (row.panels || []).forEach(panel => {
+                        const panelName = (panel?.name || '').trim();
+                        const match = panelName.match(/^5[.\-]I[.\-](\d)\b/i);
+                        if (!match) return;
+
+                        const family = parseInt(match[1], 10);
+                        if (family >= 1 && family <= 4) {
+                            groupedPanels[family].push(JSON.parse(JSON.stringify(panel)));
+                        }
+                    });
+                });
+            });
+
+            room.ltiVirtualRows = [1, 2, 3, 4].map(i => ({
+                name: `LTI-${String(i).padStart(2, '0')}`,
+                panels: groupedPanels[i]
+            }));
+
+            return room.ltiVirtualRows;
+        }
+
+        function buildLtiVirtualAisle(room) {
+            return { id: 'LTI', rows: ensureLtiVirtualRows(room) };
+        }
+
+        function getCurrentAisleData() {
+            const room = appData[currentRoom];
+            if (!room) return null;
+            if (currentAisle === 'LTI') return buildLtiVirtualAisle(room);
+            return room.aisles.find(a => a.id === currentAisle) || null;
+        }
+
+        function getRowForCurrentContext(rName) {
+            const aisle = getCurrentAisleData();
+            if (!aisle) return null;
+            return aisle.rows.find(r => r.name === rName) || null;
+        }
+
+        function syncLtiPanelPortStates(sourcePanel) {
+            const room = appData[currentRoom];
+            if (!room || !sourcePanel) return false;
+
+            const sourceName = (sourcePanel.name || '').trim();
+            if (!sourceName || !Array.isArray(sourcePanel.ports)) return false;
+
+            const syncPorts = targetPanel => {
+                if (!targetPanel || targetPanel === sourcePanel || !Array.isArray(targetPanel.ports)) return false;
+                if (targetPanel.type !== sourcePanel.type || (targetPanel.name || '').trim() !== sourceName) return false;
+
+                let changed = false;
+                targetPanel.ports.forEach((port, index) => {
+                    if (!sourcePanel.ports[index]) return;
+                    const next = Boolean(sourcePanel.ports[index].active);
+                    if (port.active !== next) {
+                        port.active = next;
+                        changed = true;
+                    }
+                });
+                return changed;
+            };
+
+            let changed = false;
+
+            room.aisles.forEach(aisle => {
+                aisle.rows.forEach(row => {
+                    if (parseRowIdentity(row.name).type !== 'LTI') return;
+                    (row.panels || []).forEach(panel => {
+                        changed = syncPorts(panel) || changed;
+                    });
+                });
+            });
+
+            if (Array.isArray(room.ltiVirtualRows)) {
+                room.ltiVirtualRows.forEach(row => {
+                    (row.panels || []).forEach(panel => {
+                        changed = syncPorts(panel) || changed;
+                    });
+                });
+            }
+
+            return changed;
+        }
+
+        function ensureCop7RequestedRows() {
+            const room = appData.COP7;
+            if (!room || !Array.isArray(room.aisles)) return false;
+
+            const targetByAisle = {
+                1: 9,
+                2: 14,
+                3: 19,
+                4: 24,
+                5: 28,
+                6: 33,
+                7: 39,
+                8: 44,
+            };
+
+            const ltrLetters = ['D', 'F', 'I', 'K', 'M', 'O', 'Q', 'S', 'U', 'W'];
+            let changed = false;
+
+            room.aisles.forEach(aisle => {
+                const targetNum = targetByAisle[aisle.id];
+                if (!targetNum || !Array.isArray(aisle.rows)) return;
+
+                const existing = new Set(
+                    aisle.rows
+                        .map(row => parseRowIdentity(row.name))
+                        .filter(identity => identity.type)
+                        .map(identity => `${identity.type}:${normalizeEmplacementToken(identity.emplacement)}`)
+                );
+
+                ltrLetters.forEach(letter => {
+                    const emplacement = `${letter}${targetNum}`;
+                    const key = `LTR:${normalizeEmplacementToken(emplacement)}`;
+
+                    if (!existing.has(key)) {
+                        aisle.rows.push({ name: formatRowName('LTR', emplacement), panels: [] });
+                        existing.add(key);
+                        changed = true;
+                    }
+                });
+
+                const ltiEmplacement = `${targetNum}`;
+                const ltiKey = `LTI:${normalizeEmplacementToken(ltiEmplacement)}`;
+                if (!existing.has(ltiKey)) {
+                    aisle.rows.push({ name: formatRowName('LTI', ltiEmplacement), panels: [] });
+                    changed = true;
+                }
+            });
+
+            return changed;
+        }
+
+        function ensureCop7MainLtrOrderFromDetailedRows() {
+            const room = appData.COP7;
+            if (!room || !Array.isArray(room.aisles)) return false;
+
+            const suffixByAisle = {
+                1: '9',
+                2: '14',
+                3: '19',
+                4: '24',
+                5: '28',
+                6: '33',
+                7: '39',
+                8: '44',
+            };
+
+            const ltrLetters = ['W', 'U', 'S', 'Q', 'O', 'M', 'K', 'I', 'F', 'D'];
+            let changed = false;
+
+            const getPanelSortKey = panel => {
+                const name = (panel?.name || '').trim();
+                if (panel?.type === 'rj45') {
+                    const cMatch = name.match(/C-(\d+)$/i);
+                    return [0, cMatch ? parseInt(cMatch[1], 10) : 999, name];
+                }
+                const fMatch = name.match(/F-(\d+)$/i);
+                return [1, fMatch ? parseInt(fMatch[1], 10) : 999, name];
+            };
+
+            room.aisles.forEach(aisle => {
+                const suffix = suffixByAisle[aisle.id];
+                if (!suffix || !Array.isArray(aisle.rows)) return;
+
+                const rowsByName = new Map(aisle.rows.map(row => [row.name, row]));
+                const mainLtrRow = rowsByName.get('Rangée LTR');
+                if (!mainLtrRow) return;
+
+                const collected = [];
+                const seen = new Set();
+
+                ltrLetters.forEach(letter => {
+                    const detailedRow = rowsByName.get(`Rangée LTR-${letter}${suffix}`);
+                    if (!detailedRow || !Array.isArray(detailedRow.panels)) return;
+
+                    detailedRow.panels.forEach(panel => {
+                        const name = (panel?.name || '').trim();
+                        if (!name || name.toLowerCase() === 'rocade vide') return;
+
+                        const key = `${panel.type}::${name}`;
+                        if (seen.has(key)) return;
+                        seen.add(key);
+                        collected.push(JSON.parse(JSON.stringify(panel)));
+                    });
+                });
+
+                if (collected.length === 0) return;
+
+                collected.sort((a, b) => {
+                    const [ta, na, sa] = getPanelSortKey(a);
+                    const [tb, nb, sb] = getPanelSortKey(b);
+                    if (ta !== tb) return ta - tb;
+                    if (na !== nb) return na - nb;
+                    return sa.localeCompare(sb, 'fr', { numeric: true });
+                });
+
+                const currentSignature = JSON.stringify(mainLtrRow.panels || []);
+                const nextSignature = JSON.stringify(collected);
+                if (currentSignature !== nextSignature) {
+                    mainLtrRow.panels = collected;
+                    changed = true;
+                }
+            });
+
+            return changed;
+        }
+
+        function syncCop7LtrPanelPortStates(aisleId, sourceRowName, sourcePanel) {
+            if (currentRoom !== 'COP7') return false;
+            if (!sourcePanel || !sourcePanel.name) return false;
+
+            const sourceName = sourcePanel.name.trim();
+            if (!/^5\.R\./i.test(sourceName)) return false;
+
+            const room = appData.COP7;
+            const aisle = room?.aisles?.find(a => a.id === aisleId);
+            if (!aisle || !Array.isArray(aisle.rows)) return false;
+
+            const mainRow = aisle.rows.find(r => r.name === 'Rangée LTR');
+            const sourceRow = aisle.rows.find(r => r.name === sourceRowName);
+            if (!sourceRow) return false;
+
+            const sourceType = sourcePanel.type;
+            const sourceActiveByPortId = new Map(
+                (sourcePanel.ports || []).map(port => [port.id, Boolean(port.active)])
+            );
+
+            const isSourceMain = sourceRowName === 'Rangée LTR';
+            const targets = isSourceMain
+                ? aisle.rows.filter(r => r !== sourceRow && r.name.startsWith('Rangée LTR-'))
+                : (mainRow ? [mainRow] : []);
+
+            let changed = false;
+            targets.forEach(row => {
+                const panel = (row.panels || []).find(p => p.type === sourceType && (p.name || '').trim() === sourceName);
+                if (!panel || !Array.isArray(panel.ports)) return;
+
+                panel.ports.forEach(port => {
+                    if (!sourceActiveByPortId.has(port.id)) return;
+                    const next = sourceActiveByPortId.get(port.id);
+                    if (port.active !== next) {
+                        port.active = next;
+                        changed = true;
+                    }
+                });
+            });
+
+            return changed;
+        }
+
         function buildRowTabOptions(aisle) {
+            // Si on est en mode LTI virtuel, afficher uniquement LTI-01 à LTI-04
+            if (aisle.id === 'LTI') {
+                return [
+                    { key: 'lti:01', label: 'LTI-01' },
+                    { key: 'lti:02', label: 'LTI-02' },
+                    { key: 'lti:03', label: 'LTI-03' },
+                    { key: 'lti:04', label: 'LTI-04' },
+                ];
+            }
+
             const ltrEmplacements = new Set();
             let hasLtrGeneral = false;
             let hasLti = false;
@@ -245,7 +552,7 @@
 
                 if (identity.type === 'LTR') {
                     if (identity.emplacement) {
-                        ltrEmplacements.add(identity.emplacement);
+                        ltrEmplacements.add(normalizeEmplacementToken(identity.emplacement));
                     } else {
                         hasLtrGeneral = true;
                     }
@@ -268,12 +575,12 @@
                 tabs.push({ key: 'ltr', label: 'LTR' });
             }
 
-            if (hasLti) {
-                tabs.push({ key: 'lti', label: 'LTI' });
-            }
-
             if (hasOther) {
                 tabs.push({ key: 'other', label: 'Autres' });
+            }
+
+            if (hasLti) {
+                tabs.push({ key: 'lti', label: 'LTI' });
             }
 
             if (tabs.length === 0) {
@@ -290,6 +597,14 @@
 
             const identity = parseRowIdentity(rowName);
 
+            // Mode LTI virtuel : filtrer par lti:01 à lti:04
+            if (tabKey.startsWith('lti:')) {
+                // Cherche LTI-X
+                const num = tabKey.split(':')[1];
+                // Accepte Rangée LTI-01, Rangée LTI-02, etc.
+                return identity.type === 'LTI' && identity.emplacement === num;
+            }
+
             if (tabKey === 'lti') {
                 return identity.type === 'LTI';
             }
@@ -299,8 +614,8 @@
             }
 
             if (tabKey.startsWith('ltr:')) {
-                const emplacement = tabKey.split(':')[1] || '';
-                return identity.type === 'LTR' && identity.emplacement === emplacement;
+                const emplacement = normalizeEmplacementToken(tabKey.split(':')[1] || '');
+                return identity.type === 'LTR' && normalizeEmplacementToken(identity.emplacement) === emplacement;
             }
 
             if (tabKey === 'other') {
@@ -542,20 +857,15 @@
 
         function updateHeaderStats() {
             const room = appData[currentRoom];
-            const aisle = room?.aisles.find(a => a.id === currentAisle);
+            if (!room) return;
+
+            const isLtiAisleMode = currentAisle === 'LTI';
+            const aisle = isLtiAisleMode
+                ? buildLtiVirtualAisle(room)
+                : room.aisles.find(a => a.id === currentAisle);
             if (!aisle) return;
 
-            let totalPorts = 0;
-            let activePorts = 0;
-
-            aisle.rows.forEach(row => {
-                row.panels.forEach(panel => {
-                    totalPorts += panel.ports.length;
-                    activePorts += panel.ports.filter(p => p.active).length;
-                });
-            });
-
-            const utilization = totalPorts > 0 ? Math.round((activePorts / totalPorts) * 100) : 0;
+            const { totalPorts, activePorts, utilization } = computeRowsStats(aisle.rows);
 
             $('#totalPorts').textContent = totalPorts;
             $('#activePorts').textContent = activePorts;
@@ -587,15 +897,7 @@
         }
 
         function sortAisles(aisleStats) {
-            if (aisleSortMode === 'numeric') {
-                return [...aisleStats].sort((left, right) => left.id - right.id);
-            }
-
-            return [...aisleStats].sort((left, right) => {
-                if (right.utilization !== left.utilization) return right.utilization - left.utilization;
-                if (right.activePorts !== left.activePorts) return right.activePorts - left.activePorts;
-                return left.id - right.id;
-            });
+            return [...aisleStats].sort((left, right) => left.id - right.id);
         }
 
         function toggleActiveAislesOnly() {
@@ -605,7 +907,7 @@
             if (!room) return;
 
             const aisleStats = sortAisles(buildAisleStats(room));
-            if (showActiveAislesOnly) {
+            if (showActiveAislesOnly && currentAisle !== 'LTI') {
                 const visible = aisleStats.filter(a => a.activePorts > 0);
                 const currentVisible = visible.some(a => a.id === currentAisle);
                 if (!currentVisible && visible.length > 0) {
@@ -619,16 +921,13 @@
             saveToLocalStorage();
         }
 
-        function toggleAisleSortMode() {
-            aisleSortMode = aisleSortMode === 'load' ? 'numeric' : 'load';
-            renderContent();
-            saveToLocalStorage();
-        }
-
         function renderContent() {
             const container = $('#mainContent');
             const room = appData[currentRoom];
-            const aisle = room?.aisles.find(a => a.id === currentAisle);
+            const isLtiAisleMode = currentAisle === 'LTI';
+            const baseAisle = room?.aisles.find(a => a.id === currentAisle);
+            const ltiAisle = room ? buildLtiVirtualAisle(room) : null;
+            const aisle = isLtiAisleMode ? ltiAisle : baseAisle;
 
             if (!room || !aisle) {
                 container.innerHTML = `<div style="display:flex;height:100%;align-items:center;justify-content:center;color:var(--text-dim);font-size:1.1rem;">Sélectionnez une allée</div>`;
@@ -667,18 +966,54 @@
                 `;
             });
 
+            if (ltiAisle) {
+                const ltiStats = computeRowsStats(ltiAisle.rows);
+                const ltiUtilClass = ltiStats.utilization >= 90 ? 'full' : ltiStats.utilization >= 70 ? 'high' : '';
+
+                aisleTabsHTML += `
+                    <button class="tab tab-aisle ${isLtiAisleMode ? 'active' : ''}" onclick="loadLtiAisle()" aria-current="${isLtiAisleMode ? 'page' : 'false'}">
+                        <span class="tab-aisle-top">
+                            <span class="tab-aisle-title">Allée LTI</span>
+                            <span class="tab-aisle-rate ${ltiUtilClass}">${ltiStats.utilization}%</span>
+                        </span>
+                        <span class="tab-aisle-meta">${ltiAisle.rows.length} rangées • ${ltiStats.activePorts}/${ltiStats.totalPorts} ports actifs</span>
+                        <span class="tab-aisle-progress">
+                            <span class="tab-aisle-progress-fill ${ltiUtilClass}" style="width: ${ltiStats.utilization}%"></span>
+                        </span>
+                    </button>
+                `;
+            }
+
             if (!aisleTabsHTML) {
                 aisleTabsHTML = `<div class="aisle-empty">Aucune allée active pour le moment</div>`;
             }
 
-            let rowTabsHTML = rowTabOptions
-                .map(tab => `<button class="tab ${currentTab === tab.key ? 'active' : ''}" onclick="setTab('${tab.key}')">${tab.label}</button>`)
-                .join('');
+            const ltrPlacementTabs = rowTabOptions.filter(tab => tab.key.startsWith('ltr:'));
+            const ltrLtiTabs = rowTabOptions.filter(tab => tab.key === 'ltr' || tab.key === 'lti');
+            const otherRowTabs = rowTabOptions.filter(tab => !(tab.key.startsWith('ltr:') || tab.key === 'ltr' || tab.key === 'lti'));
 
-            const rowTabActionsHTML = `
+            const renderRowTabButton = (tab) =>
+                `<button class="tab ${currentTab === tab.key ? 'active' : ''}" onclick="setTab('${tab.key}')">${tab.label}</button>`;
+
+            const rowTabsMainHTML = ltrPlacementTabs.map(renderRowTabButton).join('');
+            const rowTabsModesHTML = ltrLtiTabs.map(renderRowTabButton).join('');
+            const rowTabsOtherHTML = otherRowTabs.map(renderRowTabButton).join('');
+
+            const rowTabsHTML = `
+                <div class="row-tabs-line">
+                    <div class="tabs tabs-rows tabs-rows-main">
+                        ${rowTabsMainHTML}
+                    </div>
+                    ${rowTabsModesHTML ? `<div class="row-tabs-divider"></div><div class="tabs tabs-rows tabs-rows-modes">${rowTabsModesHTML}</div>` : ''}
+                    ${rowTabsOtherHTML ? `<div class="row-tabs-divider"></div><div class="tabs tabs-rows tabs-rows-other">${rowTabsOtherHTML}</div>` : ''}
+                </div>
+            `;
+
+            const rowActionsBlock = isLtiAisleMode ? '' : `
                 <div class="row-tab-actions">
-                    <button class="tab-action-btn" onclick="addRowWithType('LTR')">+ LTR</button>
-                    <button class="tab-action-btn" onclick="addRowWithType('LTI')">+ LTI</button>
+                    <button class="tab-action-btn" onclick="addRow()">Ajouter</button>
+                    <button class="tab-action-btn" onclick="renameCurrentRowFromToolbar()">Renommer</button>
+                    <button class="tab-action-btn" onclick="deleteCurrentRowFromToolbar()">Supprimer</button>
                 </div>
             `;
 
@@ -690,7 +1025,7 @@
                                 <span style="color: var(--text-muted)">${room.name}</span>
                                 <span class="breadcrumb-sep">/</span>
                             </div>
-                            <div class="breadcrumb-current">Allée ${aisle.id}</div>
+                            <div class="breadcrumb-current">${isLtiAisleMode ? 'Allée LTI' : `Allée ${aisle.id}`}</div>
                         </div>
                         <div class="search-box">
                             <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -702,7 +1037,6 @@
                     <div class="aisle-tabs-header">
                         <div class="aisle-tabs-label">Navigation des allées</div>
                         <div class="aisle-tabs-actions">
-                            <button class="aisle-filter-btn" onclick="toggleAisleSortMode()">Tri: ${aisleSortMode === 'load' ? 'charge' : 'numérique'}</button>
                             <button class="aisle-filter-btn ${showActiveAislesOnly ? 'active' : ''}" onclick="toggleActiveAislesOnly()">Allées actives</button>
                             <div class="aisle-tabs-count">${visibleAisles.length}/${room.aisles.length} allées</div>
                         </div>
@@ -711,23 +1045,13 @@
                         ${aisleTabsHTML}
                     </div>
                     <div class="toolbar-row">
-                        <div class="row-tabs-wrap">
-                            <div class="tabs tabs-rows">
-                                ${rowTabsHTML}
-                            </div>
-                            ${rowTabActionsHTML}
+                        <div class="row-tabs-header">
+                            <div class="row-tabs-label">Navigation des rangées</div>
+                            <div class="row-tabs-count">${rowTabOptions.length} onglets</div>
                         </div>
-                        <div class="sub-filters" style="flex: 0 0 auto;">
-                            <div class="filter-label">Type:</div>
-                            <button class="filter-pill ${currentTypeFilter === 'all' ? 'active' : ''}" onclick="setTypeFilter('all')">
-                                <div class="dot" style="color: white"></div> Tous
-                            </button>
-                            <button class="filter-pill ${currentTypeFilter === 'rj45' ? 'active' : ''}" onclick="setTypeFilter('rj45')">
-                                 <div class="dot" style="color: #fbbf24"></div> RJ45
-                            </button>
-                            <button class="filter-pill ${currentTypeFilter === 'fo' ? 'active' : ''}" onclick="setTypeFilter('fo')">
-                                 <div class="dot" style="color: #60a5fa"></div> Fibre
-                            </button>
+                        <div class="row-tabs-wrap">
+                            ${rowTabsHTML}
+                            ${rowActionsBlock}
                         </div>
                     </div>
                 </div>
@@ -754,29 +1078,40 @@
                         <div class="row-stats" style="align-items: center;">
                             <div class="row-stat"><strong>${row.panels.length}</strong> Châssis</div>
                             <div class="row-stat"><strong>${rowActivePorts}</strong> / ${rowTotalPorts} Ports actifs</div>
+                            ${isLtiAisleMode ? '' : `
                             <button class="tool-btn" onclick="delRow('${safeRowName}')" title="Supprimer la rangée">
                                 <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                                     <path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
                                 </svg>
                             </button>
+                            `}
                         </div>
                     </div>
-                    <div class="panels-grid">`;
+                    <div class="panels-grid panels-grid-main">`;
 
-                row.panels.forEach((panel, pIdx) => {
-                    if (searchQuery && !panel.name.toLowerCase().includes(searchQuery.toLowerCase())) return;
-                    if (currentTypeFilter === 'rj45' && panel.type !== 'rj45') return;
-                    if (currentTypeFilter === 'fo' && panel.type !== 'fo') return;
+                const visiblePanels = row.panels
+                    .map((panel, pIdx) => ({ panel, pIdx }))
+                    .filter(({ panel }) => !searchQuery || panel.name.toLowerCase().includes(searchQuery.toLowerCase()));
 
-                    html += renderPanel(panel, safeRowName, pIdx);
-                });
+                for (let i = 0; i < visiblePanels.length; i++) {
+                    const { panel, pIdx } = visiblePanels[i];
+
+                    if (currentAisle === 'LTI' && panel.type === 'fo' && panel.ports.length === 12) {
+                        const foBlock = collectLtiFoBlock(visiblePanels, i);
+                        if (foBlock) {
+                            html += renderGroupedFoPanels(foBlock, safeRowName, false);
+                            i = foBlock.nextIndex - 1;
+                            continue;
+                        }
+                    }
+
+                    html += renderPanel(panel, safeRowName, pIdx, false);
+                }
+
+                html += `</div>`;
 
                 html += `
-                    <div class="add-card" title="Ajouter un châssis"
-                         ondragover="handleDragOver(event)"
-                         ondragenter="handleDragEnter(event)"
-                         ondragleave="handleDragLeave(event)"
-                         ondrop="handleDropEnd(event, '${safeRowName}')">
+                    <div class="add-card" title="Ajouter un châssis">
                         <button class="btn" onclick="addPanel('${safeRowName}', 'rj45')">+ RJ45</button>
                         <button class="btn" onclick="addPanel('${safeRowName}', 'fo')">+ Fibre</button>
                     </div>
@@ -784,25 +1119,116 @@
             });
 
             html += `
-                <div class="add-card" title="Ajouter une rangée" style="margin-top: 10px; border-color: var(--border-color); cursor: pointer;" onclick="addRow()">
-                    <div style="display: flex; align-items: center; gap: 8px; color: var(--text-muted); font-weight: 500;">
-                        <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                            <path d="M12 4v16m8-8H4"/>
-                        </svg>
-                        Ajouter une rangée
-                    </div>
-                </div>
             </div></div>`;
             container.innerHTML = html;
             const sa = $('.scroll-area');
             if(sa) sa.scrollTop = scrollPos;
         }
 
-        function renderPanel(panel, rowName, pIdx) {
+        function renderMoveControls(moveUpCall, moveDownCall) {
+            return `
+                <div class="panel-move-controls">
+                    <button class="tool-btn" onclick="${moveUpCall}" title="Monter">
+                        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M5 15l7-7 7 7"/>
+                        </svg>
+                    </button>
+                    <button class="tool-btn" onclick="${moveDownCall}" title="Descendre">
+                        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/>
+                        </svg>
+                    </button>
+                </div>
+            `;
+        }
+
+        function collectLtiFoBlock(visiblePanels, startIndex) {
+            const first = visiblePanels[startIndex];
+            if (!first) return null;
+
+            const firstPanel = first.panel;
+            if (currentAisle !== 'LTI' || firstPanel.type !== 'fo' || firstPanel.ports.length !== 12) {
+                return null;
+            }
+
+            const groupedPanels = [];
+            let cursor = startIndex;
+
+            while (cursor < visiblePanels.length) {
+                const candidate = visiblePanels[cursor];
+                const candidatePanel = candidate.panel;
+
+                if (candidatePanel.type !== 'fo' || candidatePanel.ports.length !== 12) {
+                    break;
+                }
+
+                if (firstPanel.groupId) {
+                    if (candidatePanel.groupId !== firstPanel.groupId) {
+                        break;
+                    }
+                } else if (candidatePanel.groupId || groupedPanels.length >= 4) {
+                    break;
+                }
+
+                groupedPanels.push(candidate);
+                cursor++;
+            }
+
+            if (!groupedPanels.length) return null;
+            return {
+                groupedPanels,
+                nextIndex: cursor,
+                startPanelIndex: first.pIdx,
+                blockSize: groupedPanels.length,
+                groupId: firstPanel.groupId || null
+            };
+        }
+
+        function renderGroupedFoPanels(foBlock, rowName, readOnly = false) {
+            if (!foBlock || !foBlock.groupedPanels.length) return '';
+
+            const first = foBlock.groupedPanels[0];
+            const moveControlsHtml = currentAisle === 'LTI'
+                ? renderMoveControls(
+                    foBlock.groupId
+                        ? `movePanelGroup('${rowName}', '${foBlock.groupId}', -1)`
+                        : `movePanelBlock('${rowName}', ${foBlock.startPanelIndex}, ${foBlock.blockSize}, -1)`,
+                    foBlock.groupId
+                        ? `movePanelGroup('${rowName}', '${foBlock.groupId}', 1)`
+                        : `movePanelBlock('${rowName}', ${foBlock.startPanelIndex}, ${foBlock.blockSize}, 1)`
+                )
+                : '';
+
+            const panelsHtml = foBlock.groupedPanels
+                .map(({ panel, pIdx }) => renderPanel(panel, rowName, pIdx, readOnly, false))
+                .join('');
+
+            return `
+                <div class="panel-shell panel-shell-movable panel-group-shell">
+                    ${moveControlsHtml}
+                    <div class="panels-grid panels-grid-fo panel-group-grid">
+                        ${panelsHtml}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderPanel(panel, rowName, pIdx, readOnly = false, showMoveControls = null) {
             const activeCount = panel.ports.filter(p => p.active).length;
             const usage = (activeCount / panel.ports.length) * 100;
             const usageClass = usage >= 90 ? 'full' : usage >= 70 ? 'high' : '';
             const isRJ45 = panel.type === 'rj45';
+            const isEmptyPanel = (panel.name || '').trim().toLowerCase() === 'rocade vide';
+            const canMovePanel = showMoveControls === null ? currentAisle === 'LTI' : showMoveControls;
+            const panelClasses = `panel ${panel.type}${!isRJ45 && panel.ports.length === 24 ? ' panel-wide' : ''}${isEmptyPanel ? ' panel-empty' : ''}`;
+            const portsClasses = `ports ${isRJ45 ? 'rj45' : 'fiber'}${!isRJ45 && panel.ports.length === 24 ? ' fiber-24' : ''}`;
+            const panelNameHtml = `<div class="panel-name${isRJ45 ? '' : ' panel-name-fo'}" onclick="startRenamePanel('${rowName}', ${pIdx}, event)">${panel.name}</div>`;
+            const moveControlsHtml = canMovePanel
+                ? renderMoveControls(
+                    `movePanel('${rowName}', ${pIdx}, -1)`,
+                    `movePanel('${rowName}', ${pIdx}, 1)`
+                )
+                : '';
 
             let portsHtml = '';
             panel.ports.forEach((port, idx) => {
@@ -810,7 +1236,7 @@
                 const statusText = port.active ? 'Actif' : 'Inactif';
                 const portNameDisplay = port.name ? ` : ${port.name}` : '';
                 portsHtml += `
-                    <div class="port ${activeClass}" onclick="togglePort('${rowName}', ${pIdx}, ${idx})" oncontextmenu="renamePort(event, '${rowName}', ${pIdx}, ${idx})">
+                    <div class="port ${activeClass}" ${readOnly ? '' : `onclick="togglePort('${rowName}', ${pIdx}, ${idx})" oncontextmenu="renamePort(event, '${rowName}', ${pIdx}, ${idx})"`}>
                         <div class="port-tooltip">Port ${port.id}${portNameDisplay} - ${statusText}</div>
                         <div class="led"></div>
                         <div class="connector ${isRJ45 ? 'rj45-body' : 'fiber-body'}">
@@ -825,57 +1251,105 @@
             });
 
             return `
-                <div class="panel ${panel.type}"
-                     draggable="true"
-                     ondragstart="handleDragStart(event, '${rowName}', ${pIdx})"
-                     ondragover="handleDragOver(event)"
-                     ondragenter="handleDragEnter(event)"
-                     ondragleave="handleDragLeave(event)"
-                     ondrop="handleDrop(event, '${rowName}', ${pIdx})"
-                     ondragend="handleDragEnd(event)">
-                    <div class="panel-header">
+                <div class="panel-shell${canMovePanel ? ' panel-shell-movable' : ''}">
+                    ${moveControlsHtml}
+                    <div class="${panelClasses}">
+                        <div class="panel-header">
                         <div class="panel-info">
-                            <div class="panel-name" onclick="startRenamePanel('${rowName}', ${pIdx}, event)">${panel.name}</div>
-                            <div class="panel-meta">
-                                ${panel.ports.length} Ports
-                                ${activeCount > 0 ? `<span class="active-badge">${activeCount} ON</span>` : ''}
-                            </div>
-                            <div class="usage-bar">
-                                <div class="usage-fill ${usageClass}" style="width: ${usage}%"></div>
+                            <div class="panel-headline">
+                                ${panelNameHtml}
+                                <div class="panel-meta">
+                                    <span>${panel.ports.length} Ports</span>
+                                    <div class="usage-bar usage-bar-inline">
+                                        <div class="usage-fill ${usageClass}" style="width: ${usage}%"></div>
+                                    </div>
+                                    ${activeCount > 0 ? `<span class="active-badge">${activeCount} ON</span>` : ''}
+                                </div>
                             </div>
                         </div>
                         <div class="panel-tools">
-                            ${isRJ45 ? `
+                            ${readOnly ? '' : `${isRJ45 ? `
                             <button class="tool-btn" onclick="toggleRj45PortCount('${rowName}', ${pIdx})" title="Basculer entre 24 et 48 ports">
                                 <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"/>
                                 </svg>
                             </button>
                             ` : ''}
-                            <button class="tool-btn" onclick="setAll('${rowName}', ${pIdx}, true)" title="Tout allumer">
-                                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                                    <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
-                                </svg>
-                            </button>
-                            <button class="tool-btn" onclick="setAll('${rowName}', ${pIdx}, false)" title="Tout éteindre">
-                                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                                    <path d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"/>
-                                </svg>
-                            </button>
-                            <button class="tool-btn" onclick="delPanel('${rowName}', ${pIdx})" title="Supprimer">
+                            <button class="tool-btn" onclick="delPanel('${rowName}', ${pIdx})" title="Vider (Rocade vide)">
                                 <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                                     <path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
                                 </svg>
                             </button>
+                            <button class="tool-btn tool-btn-danger" onclick="deletePanelLine('${rowName}', ${pIdx})" title="Supprimer la ligne">
+                                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+                                </svg>
+                            </button>
+                            `}
                         </div>
                     </div>
-                    <div class="ports ${isRJ45 ? 'rj45' : 'fiber'}">${portsHtml}</div>
+                    <div class="${portsClasses}">${portsHtml}</div>
+                    </div>
                 </div>`;
         }
 
         function setTab(t) { currentTab = t; renderContent(); }
-        function setTypeFilter(t) { currentTypeFilter = t; renderContent(); }
         function search(v) { searchQuery = v; renderContent(); }
+
+        function getRowsForCurrentTab(aisle) {
+            if (!aisle) return [];
+            return aisle.rows.filter(row => shouldShowRowForTab(row.name, currentTab));
+        }
+
+        function renameCurrentRowFromToolbar() {
+            const aisle = appData[currentRoom]?.aisles.find(a => a.id === currentAisle);
+            if (!aisle) return;
+
+            const rows = getRowsForCurrentTab(aisle);
+            if (rows.length !== 1) {
+                showToast("Sélectionnez un onglet qui correspond à une seule rangée pour renommer", "error");
+                return;
+            }
+
+            const row = rows[0];
+            const identity = parseRowIdentity(row.name);
+            const initialText = (identity.type === 'LTR' || identity.type === 'LTI')
+                ? (identity.emplacement || '')
+                : row.name;
+
+            const input = prompt("Nouveau nom / emplacement :", initialText);
+            if (input === null) return;
+            const value = input.trim();
+            if (!value) return;
+
+            const nextName = (identity.type === 'LTR' || identity.type === 'LTI')
+                ? formatRowName(identity.type, value)
+                : value;
+
+            if (aisle.rows.some(r => r !== row && r.name.toUpperCase() === nextName.toUpperCase())) {
+                showToast("Une rangée avec ce nom existe déjà", "error");
+                return;
+            }
+
+            row.name = nextName;
+            renderContent();
+            saveToLocalStorage();
+            showToast("Rangée renommée", "success");
+        }
+
+        function deleteCurrentRowFromToolbar() {
+            const aisle = appData[currentRoom]?.aisles.find(a => a.id === currentAisle);
+            if (!aisle) return;
+
+            const rows = getRowsForCurrentTab(aisle);
+            if (rows.length !== 1) {
+                showToast("Sélectionnez un onglet qui correspond à une seule rangée pour supprimer", "error");
+                return;
+            }
+
+            const rowName = rows[0].name;
+            delRow(rowName);
+        }
 
         function loadAisle(aisleId) {
             currentAisle = aisleId;
@@ -886,17 +1360,33 @@
             updateHeaderStats();
         }
 
+        function loadLtiAisle() {
+            currentAisle = 'LTI';
+            appState.selectedAisle = 'LTI';
+            searchQuery = '';
+            currentTab = 'lti';
+            renderContent();
+            updateHeaderStats();
+            saveToLocalStorage();
+        }
+
         function togglePort(rName, pIdx, ptIdx) {
-            const row = appData[currentRoom].aisles.find(a => a.id === currentAisle).rows.find(r => r.name === rName);
+            const row = getRowForCurrentContext(rName);
+            if (!row || !row.panels[pIdx] || !row.panels[pIdx].ports[ptIdx]) return;
             row.panels[pIdx].ports[ptIdx].active = !row.panels[pIdx].ports[ptIdx].active;
+            syncLtiPanelPortStates(row.panels[pIdx]);
+            syncCop7LtrPanelPortStates(currentAisle, rName, row.panels[pIdx]);
             renderContent();
             updateHeaderStats();
             saveToLocalStorage();
         }
 
         function setAll(rName, pIdx, state) {
-            const row = appData[currentRoom].aisles.find(a => a.id === currentAisle).rows.find(r => r.name === rName);
+            const row = getRowForCurrentContext(rName);
+            if (!row || !row.panels[pIdx]) return;
             row.panels[pIdx].ports.forEach(p => p.active = state);
+            syncLtiPanelPortStates(row.panels[pIdx]);
+            syncCop7LtrPanelPortStates(currentAisle, rName, row.panels[pIdx]);
             renderContent();
             updateHeaderStats();
             saveToLocalStorage();
@@ -905,7 +1395,7 @@
 
         function startRenamePanel(rName, pIdx, e) {
             e.stopPropagation();
-            const row = appData[currentRoom].aisles.find(a => a.id === currentAisle).rows.find(r => r.name === rName);
+            const row = getRowForCurrentContext(rName);
             if (!row) return;
 
             const panel = row.panels[pIdx];
@@ -916,7 +1406,6 @@
                 panel.name,
                 (newName) => {
                     panel.name = newName;
-                    row.panels.sort((a, b) => a.name.localeCompare(b.name, 'fr', { numeric: true }));
                     renderContent();
                     saveToLocalStorage();
                     showToast("Nom du châssis mis à jour", "success");
@@ -926,7 +1415,8 @@
 
         function renamePort(e, rName, pIdx, ptIdx) {
             e.preventDefault();
-            const row = appData[currentRoom].aisles.find(a => a.id === currentAisle).rows.find(r => r.name === rName);
+            const row = getRowForCurrentContext(rName);
+            if (!row || !row.panels[pIdx] || !row.panels[pIdx].ports[ptIdx]) return;
             const port = row.panels[pIdx].ports[ptIdx];
             const newN = prompt(`Nom ou description pour le port ${port.id} :`, port.name || "");
             if (newN !== null) {
@@ -976,8 +1466,22 @@
             const aisle = appData[currentRoom].aisles.find(a => a.id === currentAisle);
             const rowIndex = aisle.rows.findIndex(r => r.name === rName);
             if (rowIndex > -1) {
+                const prevTab = currentTab;
+                const prevTabOptions = buildRowTabOptions(aisle);
+                const prevTabIndex = prevTabOptions.findIndex(t => t.key === prevTab);
+
                 aisle.rows.splice(rowIndex, 1);
-                currentTab = 'all';
+
+                const newTabOptions = buildRowTabOptions(aisle);
+                if (newTabOptions.some(t => t.key === prevTab)) {
+                    currentTab = prevTab;
+                } else if (newTabOptions.length > 0) {
+                    const fallbackIndex = Math.min(prevTabIndex >= 0 ? prevTabIndex : 0, newTabOptions.length - 1);
+                    currentTab = newTabOptions[fallbackIndex].key;
+                } else {
+                    currentTab = 'all';
+                }
+
                 renderContent();
                 updateHeaderStats();
                 saveToLocalStorage();
@@ -1016,33 +1520,97 @@
         }
 
         function delPanel(rName, pIdx) {
-            if (!confirm("Supprimer ce châssis ?")) return;
-            const row = appData[currentRoom].aisles.find(a => a.id === currentAisle).rows.find(r => r.name === rName);
-            row.panels.splice(pIdx, 1);
+            if (!confirm("Vider ce châssis ?")) return;
+            const row = getRowForCurrentContext(rName);
+            if (!row) return;
+            const panel = row.panels[pIdx];
+            if (!panel) return;
+
+            panel.name = 'Rocade vide';
+            panel.ports = panel.ports.map((port, index) => ({
+                ...port,
+                id: port.id || index + 1,
+                name: '',
+                active: false,
+            }));
+
             renderContent();
             updateHeaderStats();
             saveToLocalStorage();
-            showToast("Châssis supprimé");
+            showToast("Châssis vidé");
+        }
+
+        function deletePanelLine(rName, pIdx) {
+            if (!confirm("Supprimer définitivement cette ligne ?")) return;
+            const row = getRowForCurrentContext(rName);
+            if (!row) return;
+            if (pIdx < 0 || pIdx >= row.panels.length) return;
+
+            row.panels.splice(pIdx, 1);
+
+            renderContent();
+            updateHeaderStats();
+            saveToLocalStorage();
+            showToast("Ligne supprimée", "success");
         }
 
         function addPanel(rName, type) {
-            const row = appData[currentRoom].aisles.find(a => a.id === currentAisle).rows.find(r => r.name === rName);
+            const row = getRowForCurrentContext(rName);
+            if (!row) return;
 
-            const defaultName = type === 'rj45' ? 'Nouveau RJ45' : 'Nouveau FO';
+            if (type === 'fo') {
+                if (currentAisle === 'LTI') {
+                    const choice = prompt(
+                        "Format fibre :\n1 = 4 blocs de 12 ports\n2 = 1 ligne de 24 ports",
+                        "1"
+                    );
+
+                    if (choice === null) return;
+
+                    if (choice.trim() === '2') {
+                        row.panels.push({
+                            type: 'fo',
+                            name: 'Rocade vide',
+                            ports: generatePorts(24, 'fiber')
+                        });
+
+                        renderContent();
+                        updateHeaderStats();
+                        saveToLocalStorage();
+                        showToast("Châssis fibre 24 ports ajouté", "success");
+                        return;
+                    }
+                }
+
+                const groupId = `fo12-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+                for (let i = 0; i < 4; i++) {
+                    row.panels.push({
+                        type: 'fo',
+                        name: 'Rocade vide',
+                        ports: generatePorts(12, 'fiber'),
+                        groupId
+                    });
+                }
+
+                renderContent();
+                updateHeaderStats();
+                saveToLocalStorage();
+                showToast("4 châssis fibre ajoutés", "success");
+                return;
+            }
+
+            const defaultName = 'Nouveau RJ45';
             const panelName = prompt("Nom du nouveau châssis :", defaultName);
 
             if (panelName === null) return;
             const finalName = panelName.trim() || defaultName;
 
-            const count = type === 'fo' ? 12 : 24;
-
             row.panels.push({
-                type: type,
+                type: 'rj45',
                 name: finalName,
-                ports: generatePorts(count, type === 'rj45' ? 'rj45' : 'fiber')
+                ports: generatePorts(24, 'rj45')
             });
-
-            row.panels.sort((a, b) => a.name.localeCompare(b.name, 'fr', { numeric: true }));
 
             renderContent();
             updateHeaderStats();
@@ -1074,7 +1642,8 @@
         }
 
         function toggleRj45PortCount(rName, pIdx) {
-            const row = appData[currentRoom].aisles.find(a => a.id === currentAisle).rows.find(r => r.name === rName);
+            const row = getRowForCurrentContext(rName);
+            if (!row || !row.panels[pIdx]) return;
             const panel = row.panels[pIdx];
 
             if (panel.type !== 'rj45') return;
@@ -1102,6 +1671,136 @@
             showToast(`Châssis mis à jour (${newCount} ports)`, "success");
         }
 
+        function movePanel(rName, pIdx, direction) {
+            const row = getRowForCurrentContext(rName);
+            if (!row || !Array.isArray(row.panels)) return;
+
+            const targetIdx = pIdx + direction;
+            if (targetIdx < 0 || targetIdx >= row.panels.length) return;
+
+            const [panel] = row.panels.splice(pIdx, 1);
+            row.panels.splice(targetIdx, 0, panel);
+
+            renderContent();
+            saveToLocalStorage();
+        }
+
+        function getPanelUnitBounds(panels, startIdx) {
+            const panel = panels[startIdx];
+            if (!panel) return null;
+
+            if (panel.type === 'fo' && panel.ports.length === 12 && panel.groupId) {
+                let start = startIdx;
+                let end = startIdx;
+
+                while (start > 0) {
+                    const prev = panels[start - 1];
+                    if (!prev || prev.groupId !== panel.groupId || prev.type !== 'fo' || prev.ports.length !== 12) break;
+                    start--;
+                }
+
+                while (end < panels.length - 1) {
+                    const next = panels[end + 1];
+                    if (!next || next.groupId !== panel.groupId || next.type !== 'fo' || next.ports.length !== 12) break;
+                    end++;
+                }
+
+                return { start, end };
+            }
+
+            if (currentAisle === 'LTI' && panel.type === 'fo' && panel.ports.length === 12 && !panel.groupId) {
+                let runStart = startIdx;
+                let runEnd = startIdx;
+
+                while (runStart > 0) {
+                    const prev = panels[runStart - 1];
+                    if (!prev || prev.type !== 'fo' || prev.ports.length !== 12 || prev.groupId) break;
+                    runStart--;
+                }
+
+                while (runEnd < panels.length - 1) {
+                    const next = panels[runEnd + 1];
+                    if (!next || next.type !== 'fo' || next.ports.length !== 12 || next.groupId) break;
+                    runEnd++;
+                }
+
+                const offsetInRun = startIdx - runStart;
+                const blockStart = runStart + Math.floor(offsetInRun / 4) * 4;
+                const blockEnd = Math.min(blockStart + 3, runEnd);
+
+                return { start: blockStart, end: blockEnd };
+            }
+
+            return { start: startIdx, end: startIdx };
+        }
+
+        function movePanelBlock(rName, startIdx, blockSize, direction) {
+            const row = getRowForCurrentContext(rName);
+            if (!row || !Array.isArray(row.panels)) return;
+
+            const safeStartIdx = Number(startIdx);
+            const safeBlockSize = Number(blockSize);
+            if (!Number.isInteger(safeStartIdx) || !Number.isInteger(safeBlockSize) || safeBlockSize <= 0) return;
+            if (safeStartIdx < 0 || safeStartIdx + safeBlockSize > row.panels.length) return;
+
+            const movingPanels = row.panels.slice(safeStartIdx, safeStartIdx + safeBlockSize);
+            const isValidFoBlock = movingPanels.every(panel => panel?.type === 'fo' && panel.ports?.length === 12);
+            if (!isValidFoBlock) return;
+
+            const currentBounds = { start: safeStartIdx, end: safeStartIdx + safeBlockSize - 1 };
+
+            if (direction < 0) {
+                if (currentBounds.start === 0) return;
+                const previousBounds = getPanelUnitBounds(row.panels, currentBounds.start - 1);
+                if (!previousBounds) return;
+
+                row.panels.splice(currentBounds.start, safeBlockSize);
+                row.panels.splice(previousBounds.start, 0, ...movingPanels);
+            } else {
+                if (currentBounds.end >= row.panels.length - 1) return;
+                const nextBounds = getPanelUnitBounds(row.panels, currentBounds.end + 1);
+                if (!nextBounds) return;
+
+                row.panels.splice(currentBounds.start, safeBlockSize);
+                const insertAt = nextBounds.end - safeBlockSize + 1;
+                row.panels.splice(insertAt, 0, ...movingPanels);
+            }
+
+            renderContent();
+            saveToLocalStorage();
+        }
+
+        function movePanelGroup(rName, groupId, direction) {
+            const row = getRowForCurrentContext(rName);
+            if (!row || !Array.isArray(row.panels)) return;
+
+            const startIdx = row.panels.findIndex(panel => panel.groupId === groupId && panel.type === 'fo' && panel.ports.length === 12);
+            if (startIdx === -1) return;
+
+            const currentBounds = getPanelUnitBounds(row.panels, startIdx);
+            if (!currentBounds) return;
+
+            if (direction < 0) {
+                if (currentBounds.start === 0) return;
+                const previousBounds = getPanelUnitBounds(row.panels, currentBounds.start - 1);
+                if (!previousBounds) return;
+
+                const movingPanels = row.panels.splice(currentBounds.start, currentBounds.end - currentBounds.start + 1);
+                row.panels.splice(previousBounds.start, 0, ...movingPanels);
+            } else {
+                if (currentBounds.end >= row.panels.length - 1) return;
+                const nextBounds = getPanelUnitBounds(row.panels, currentBounds.end + 1);
+                if (!nextBounds) return;
+
+                const movingPanels = row.panels.splice(currentBounds.start, currentBounds.end - currentBounds.start + 1);
+                const insertAt = nextBounds.end - (currentBounds.end - currentBounds.start + 1) + 1;
+                row.panels.splice(insertAt, 0, ...movingPanels);
+            }
+
+            renderContent();
+            saveToLocalStorage();
+        }
+
         function exportData() {
             const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(appData, null, 2));
             const a = document.createElement('a');
@@ -1120,6 +1819,8 @@
             r.onload = async (ev) => {
                 try {
                     appData = JSON.parse(ev.target.result);
+                    ensureCop7RequestedRows();
+                    ensureCop7MainLtrOrderFromDetailedRows();
                     await syncStateToServer();
                     await init();
                     showToast("Configuration importée avec succès", "success");
@@ -1144,96 +1845,6 @@
                 console.error('Erreur de réinitialisation:', err);
                 showToast("Erreur réseau lors de la réinitialisation", "error");
             }
-        }
-
-        function handleDragStart(e, rName, pIdx) {
-            draggedItem = { rowName: rName, panelIndex: pIdx };
-            setTimeout(() => { if(e.target) e.target.classList.add('dragging'); }, 0);
-            e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', pIdx);
-        }
-
-        function handleDragOver(e) {
-            e.preventDefault();
-            e.dataTransfer.dropEffect = 'move';
-            return false;
-        }
-
-        function handleDragEnter(e) {
-            e.preventDefault();
-            const dropTarget = e.target.closest('.panel') || e.target.closest('.add-card');
-            if (dropTarget) dropTarget.classList.add('drag-over');
-        }
-
-        function handleDragLeave(e) {
-            const dropTarget = e.target.closest('.panel') || e.target.closest('.add-card');
-            if (dropTarget && !dropTarget.contains(e.relatedTarget)) {
-                dropTarget.classList.remove('drag-over');
-            }
-        }
-
-        function handleDragEnd(e) {
-            if(e.target) e.target.classList.remove('dragging');
-            document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
-            draggedItem = null;
-        }
-
-        function handleDrop(e, targetRowName, targetIdx) {
-            e.preventDefault();
-            e.stopPropagation();
-            document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
-
-            if (!draggedItem) return;
-
-            const sourceRowName = draggedItem.rowName;
-            const sourceIdx = draggedItem.panelIndex;
-
-            if (sourceRowName === targetRowName && sourceIdx === targetIdx) return;
-
-            const aisle = appData[currentRoom].aisles.find(a => a.id === currentAisle);
-            const sourceRow = aisle.rows.find(r => r.name === sourceRowName);
-            const targetRow = aisle.rows.find(r => r.name === targetRowName);
-
-            if (!sourceRow || !targetRow) return;
-
-            const [movedPanel] = sourceRow.panels.splice(sourceIdx, 1);
-
-            let insertIdx = targetIdx;
-            if (sourceRowName === targetRowName && sourceIdx < targetIdx) {
-                insertIdx--;
-            }
-
-            targetRow.panels.splice(insertIdx, 0, movedPanel);
-
-            renderContent();
-            updateHeaderStats();
-            saveToLocalStorage();
-        }
-
-        function handleDropEnd(e, targetRowName) {
-            e.preventDefault();
-            e.stopPropagation();
-            document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
-
-            if (!draggedItem) return;
-
-            const sourceRowName = draggedItem.rowName;
-            const sourceIdx = draggedItem.panelIndex;
-
-            const aisle = appData[currentRoom].aisles.find(a => a.id === currentAisle);
-            const sourceRow = aisle.rows.find(r => r.name === sourceRowName);
-            const targetRow = aisle.rows.find(r => r.name === targetRowName);
-
-            if (!sourceRow || !targetRow) return;
-
-            if (sourceRowName === targetRowName && sourceIdx === sourceRow.panels.length - 1) return;
-
-            const [movedPanel] = sourceRow.panels.splice(sourceIdx, 1);
-            targetRow.panels.push(movedPanel);
-
-            renderContent();
-            updateHeaderStats();
-            saveToLocalStorage();
         }
 
         init();
