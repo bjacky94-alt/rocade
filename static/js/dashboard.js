@@ -87,6 +87,33 @@
 
         let syncTimer = null;
 
+        function setCloudSyncStatus(message, status = 'idle') {
+            const statusEl = $('#cloudSyncStatus');
+            if (!statusEl) return;
+            statusEl.textContent = message;
+            statusEl.dataset.status = status;
+        }
+
+        function setCloudSaveLoading(isLoading) {
+            const saveButton = $('#btnCloudSave');
+            if (!saveButton) return;
+            saveButton.classList.toggle('is-loading', isLoading);
+        }
+
+        function formatTimeFromIso(isoValue) {
+            if (!isoValue) return '';
+
+            const dt = new Date(isoValue);
+            if (Number.isNaN(dt.getTime())) {
+                return '';
+            }
+
+            return dt.toLocaleTimeString('fr-FR', {
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        }
+
         function scheduleSync() {
             if (syncTimer) {
                 clearTimeout(syncTimer);
@@ -96,7 +123,12 @@
             }, 250);
         }
 
-        async function syncStateToServer() {
+        async function syncStateToServer(options = {}) {
+            const {
+                showSuccessToast = false,
+                showErrorToast = false
+            } = options;
+
             const payload = {
                 data: JSON.stringify(appData),
                 uiState: JSON.stringify({
@@ -109,10 +141,19 @@
             if (IS_STATIC_DEPLOY) {
                 localStorage.setItem(STORAGE_DATA_KEY, payload.data);
                 localStorage.setItem(STORAGE_UI_KEY, payload.uiState);
-                return;
+                setCloudSyncStatus('Mode local: sauvegarde navigateur', 'idle');
+
+                if (showSuccessToast) {
+                    showToast('Sauvegarde locale effectuée (pas de cloud sur ce mode)', 'success');
+                }
+
+                return true;
             }
 
             try {
+                setCloudSaveLoading(true);
+                setCloudSyncStatus('Synchronisation cloud en cours...', 'syncing');
+
                 const response = await fetch('/api/rocade/state', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
@@ -120,15 +161,42 @@
                 });
 
                 if (!response.ok) {
-                    console.error('Erreur API de sauvegarde', await response.text());
+                    throw new Error(await response.text());
                 }
+
+                const result = await response.json();
+                const savedAt = formatTimeFromIso(result.updatedAt);
+                const label = savedAt
+                    ? `Cloud synchronise a ${savedAt}`
+                    : 'Cloud synchronise';
+
+                setCloudSyncStatus(label, 'ok');
+
+                if (showSuccessToast) {
+                    showToast('Donnees sauvegardees dans le cloud', 'success');
+                }
+
+                return true;
             } catch (err) {
                 console.error('Erreur de synchronisation serveur:', err);
+                setCloudSyncStatus('Erreur de synchronisation cloud', 'error');
+
+                if (showErrorToast) {
+                    showToast('Echec de la sauvegarde cloud', 'error');
+                }
+
+                return false;
+            } finally {
+                setCloudSaveLoading(false);
             }
         }
 
         function saveToLocalStorage() {
             scheduleSync();
+        }
+
+        async function saveCloudNow() {
+            await syncStateToServer({ showSuccessToast: true, showErrorToast: true });
         }
 
         async function loadFromServer() {
@@ -165,21 +233,30 @@
             };
 
             if (IS_STATIC_DEPLOY) {
+                setCloudSyncStatus('Mode local: sauvegarde navigateur', 'idle');
                 return tryLoadFromLocal();
             }
 
             try {
                 const response = await fetch('/api/rocade/state');
                 if (!response.ok) {
+                    setCloudSyncStatus('Cloud indisponible, tentative locale', 'error');
                     return tryLoadFromLocal();
                 }
 
                 const payload = await response.json();
                 if (!payload || !payload.data || !payload.uiState) {
+                    setCloudSyncStatus('Aucune sauvegarde cloud trouvee', 'idle');
                     return false;
                 }
 
                 appData = JSON.parse(payload.data);
+                const loadedAt = formatTimeFromIso(payload.updatedAt);
+                const loadedLabel = loadedAt
+                    ? `Cloud charge (${loadedAt})`
+                    : 'Cloud charge';
+                setCloudSyncStatus(loadedLabel, 'ok');
+
                 const wasNormalized = ensureCop7RequestedRows();
                 const wasAligned = ensureCop7MainLtrOrderFromDetailedRows();
                 if (wasNormalized || wasAligned) {
@@ -201,6 +278,7 @@
                 }
             } catch (err) {
                 console.error('Erreur de chargement serveur:', err);
+                setCloudSyncStatus('Erreur de chargement cloud', 'error');
             }
 
             return tryLoadFromLocal();
