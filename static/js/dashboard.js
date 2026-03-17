@@ -84,9 +84,8 @@
         const STORAGE_DATA_KEY = 'rocade_app_data_v1';
         const STORAGE_UI_KEY = 'rocade_app_ui_v1';
         const IS_STATIC_DEPLOY = window.location.hostname.endsWith('github.io') || window.location.protocol === 'file:';
-        const DEFAULT_CLOUD_API_BASE = 'https://rocade.onrender.com';
         const CONFIGURED_CLOUD_API_BASE = (window.__ROCADE_CLOUD_API__ || '').trim().replace(/\/$/, '');
-        const CLOUD_API_BASE = CONFIGURED_CLOUD_API_BASE || (IS_STATIC_DEPLOY ? DEFAULT_CLOUD_API_BASE : '');
+        const CLOUD_API_BASE = CONFIGURED_CLOUD_API_BASE || '';
         const CLOUD_ENABLED = !IS_STATIC_DEPLOY || Boolean(CLOUD_API_BASE);
 
         function apiUrl(path) {
