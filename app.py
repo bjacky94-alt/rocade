@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, g, jsonify, render_template, request
+from flask_cors import CORS
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -17,6 +18,18 @@ AUTO_BACKUP_KEEP_FILES = 200
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "rocade-dev-secret"
+
+DEFAULT_CORS_ORIGINS = [
+    "https://bjacky94-alt.github.io",
+    "http://localhost:5000",
+    "http://127.0.0.1:5000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+raw_origins = os.getenv("ALLOWED_CLOUD_ORIGINS", ",".join(DEFAULT_CORS_ORIGINS))
+allowed_origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
 
 
 def _state_hash(data_json: str, ui_state_json: str) -> str:

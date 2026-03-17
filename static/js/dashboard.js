@@ -84,6 +84,17 @@
         const STORAGE_DATA_KEY = 'rocade_app_data_v1';
         const STORAGE_UI_KEY = 'rocade_app_ui_v1';
         const IS_STATIC_DEPLOY = window.location.hostname.endsWith('github.io') || window.location.protocol === 'file:';
+        const DEFAULT_CLOUD_API_BASE = 'https://rocade.onrender.com';
+        const CONFIGURED_CLOUD_API_BASE = (window.__ROCADE_CLOUD_API__ || '').trim().replace(/\/$/, '');
+        const CLOUD_API_BASE = CONFIGURED_CLOUD_API_BASE || (IS_STATIC_DEPLOY ? DEFAULT_CLOUD_API_BASE : '');
+        const CLOUD_ENABLED = !IS_STATIC_DEPLOY || Boolean(CLOUD_API_BASE);
+
+        function apiUrl(path) {
+            if (CLOUD_API_BASE) {
+                return `${CLOUD_API_BASE}${path}`;
+            }
+            return path;
+        }
 
         let syncTimer = null;
 
@@ -138,7 +149,7 @@
                 })
             };
 
-            if (IS_STATIC_DEPLOY) {
+            if (!CLOUD_ENABLED) {
                 localStorage.setItem(STORAGE_DATA_KEY, payload.data);
                 localStorage.setItem(STORAGE_UI_KEY, payload.uiState);
                 setCloudSyncStatus('Mode local: sauvegarde navigateur', 'idle');
@@ -154,7 +165,7 @@
                 setCloudSaveLoading(true);
                 setCloudSyncStatus('Synchronisation cloud en cours...', 'syncing');
 
-                const response = await fetch('/api/rocade/state', {
+                const response = await fetch(apiUrl('/api/rocade/state'), {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
@@ -232,13 +243,13 @@
                 return false;
             };
 
-            if (IS_STATIC_DEPLOY) {
+            if (!CLOUD_ENABLED) {
                 setCloudSyncStatus('Mode local: sauvegarde navigateur', 'idle');
                 return tryLoadFromLocal();
             }
 
             try {
-                const response = await fetch('/api/rocade/state');
+                const response = await fetch(apiUrl('/api/rocade/state'));
                 if (!response.ok) {
                     setCloudSyncStatus('Cloud indisponible, tentative locale', 'error');
                     return tryLoadFromLocal();
@@ -1959,7 +1970,7 @@
         async function resetData() {
             if (!confirm("Êtes-vous sûr de vouloir réinitialiser toutes les données ? Cette action est irréversible.")) return;
 
-            if (IS_STATIC_DEPLOY) {
+            if (!CLOUD_ENABLED) {
                 localStorage.removeItem(STORAGE_DATA_KEY);
                 localStorage.removeItem(STORAGE_UI_KEY);
                 location.reload();
@@ -1967,7 +1978,7 @@
             }
 
             try {
-                const response = await fetch('/api/rocade/state', { method: 'DELETE' });
+                const response = await fetch(apiUrl('/api/rocade/state'), { method: 'DELETE' });
                 if (!response.ok) {
                     showToast("Impossible de réinitialiser côté serveur", "error");
                     return;
