@@ -883,12 +883,14 @@
         }
 
         .tabs-aisles {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
             gap: 8px;
+            width: 100%;
             padding-bottom: 2px;
-            scroll-snap-type: x proximity;
-                flex-wrap: wrap;
-                overflow-x: visible;
-                scrollbar-width: none;
+            overflow: visible;
+            scroll-snap-type: none;
+            scrollbar-width: none;
         }
 
         .tab-aisle {
@@ -896,14 +898,15 @@
             flex-direction: column;
             align-items: flex-start;
             gap: 5px;
-                flex: 1 1 150px;
-                min-width: 150px;
-                max-width: 220px;
+            min-width: 0;
+            max-width: none;
+            width: 100%;
             padding: 8px 12px;
             border-radius: 8px;
             border-color: rgba(255, 255, 255, 0.11);
             background: linear-gradient(135deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.01));
-            scroll-snap-align: start;
+            scroll-snap-align: unset;
+            white-space: normal;
         }
         .tab-aisle.status-low {
             border-color: rgba(34, 197, 94, 0.3);
@@ -988,9 +991,12 @@
         }
 
         @media (max-width: 720px) {
+            .tabs-aisles {
+                grid-template-columns: 1fr;
+            }
+
             .tab-aisle {
-                flex-basis: 100%;
-                max-width: none;
+                width: 100%;
             }
         }
         .tab-aisle.active .tab-aisle-title {
