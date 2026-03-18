@@ -101,45 +101,6 @@
             justify-content: flex-end;
         }
 
-        .cloud-sync-status {
-            font-size: 0.75rem;
-            padding: 5px 10px;
-            border-radius: 999px;
-            border: 1px solid var(--border-color);
-            background: rgba(255, 255, 255, 0.04);
-            color: var(--text-muted);
-            white-space: nowrap;
-            cursor: pointer;
-            transition: opacity 0.2s;
-        }
-
-        .cloud-sync-status:hover {
-            opacity: 0.8;
-        }
-
-        .cloud-sync-status[data-status="syncing"] {
-            color: #bfdbfe;
-            border-color: rgba(59, 130, 246, 0.45);
-            background: rgba(59, 130, 246, 0.14);
-        }
-
-        .cloud-sync-status[data-status="ok"] {
-            color: #a7f3d0;
-            border-color: rgba(16, 185, 129, 0.45);
-            background: rgba(16, 185, 129, 0.16);
-        }
-
-        .cloud-sync-status[data-status="error"] {
-            color: #fecaca;
-            border-color: rgba(239, 68, 68, 0.45);
-            background: rgba(239, 68, 68, 0.15);
-        }
-
-        #btnCloudSave.is-loading {
-            opacity: 0.72;
-            pointer-events: none;
-        }
-
         .btn {
             background: var(--bg-elevated);
             border: 1px solid var(--border-color);
@@ -1308,6 +1269,9 @@
             flex: 1;
             width: 100%;
         }
+        .panel-group-grid.panel-group-grid-two-inline {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
         .panel-info {
             display: flex;
             flex: 1;
@@ -1511,7 +1475,20 @@
         .ports { display: grid; gap: 8px; }
         .ports.rj45 { grid-template-columns: repeat(24, 1fr); gap: 6px 8px; }
         .ports.fiber { grid-template-columns: repeat(6, 1fr); gap: 12px 10px; }
+        .ports.fiber.fiber-12-inline { grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 6px 8px; }
         .ports.fiber.fiber-24 { grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 6px 8px; }
+        .ports.fiber.fiber-12-inline .port { gap: 3px; }
+        .ports.fiber.fiber-12-inline .lc-port {
+            width: 11px;
+            height: 11px;
+        }
+        .ports.fiber.fiber-12-inline .ferrule {
+            width: 4px;
+            height: 4px;
+        }
+        .ports.fiber.fiber-12-inline .p-label {
+            font-size: 0.54rem;
+        }
         .ports.fiber.fiber-24 .port { gap: 3px; }
         .ports.fiber.fiber-24 .lc-port {
             width: 9px;
@@ -1727,11 +1704,6 @@
         @media (max-width: 960px) {
             .header-actions {
                 gap: 8px;
-            }
-
-            .cloud-sync-status {
-                width: 100%;
-                text-align: center;
             }
 
             .toolbar {

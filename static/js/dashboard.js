@@ -97,19 +97,6 @@
 
         let syncTimer = null;
 
-        function setCloudSyncStatus(message, status = 'idle') {
-            const statusEl = $('#cloudSyncStatus');
-            if (!statusEl) return;
-            statusEl.textContent = message;
-            statusEl.dataset.status = status;
-        }
-
-        function setCloudSaveLoading(isLoading) {
-            const saveButton = $('#btnCloudSave');
-            if (!saveButton) return;
-            saveButton.classList.toggle('is-loading', isLoading);
-        }
-
         function formatTimeFromIso(isoValue) {
             if (!isoValue) return '';
 
@@ -151,7 +138,6 @@
             if (!CLOUD_ENABLED) {
                 localStorage.setItem(STORAGE_DATA_KEY, payload.data);
                 localStorage.setItem(STORAGE_UI_KEY, payload.uiState);
-                setCloudSyncStatus('Mode local: sauvegarde navigateur', 'idle');
 
                 if (showSuccessToast) {
                     showToast('Sauvegarde locale effectuée (pas de cloud sur ce mode)', 'success');
@@ -161,9 +147,6 @@
             }
 
             try {
-                setCloudSaveLoading(true);
-                setCloudSyncStatus('Synchronisation cloud en cours...', 'syncing');
-
                 const response = await fetch(apiUrl('/api/rocade/state'), {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
@@ -174,13 +157,7 @@
                     throw new Error(await response.text());
                 }
 
-                const result = await response.json();
-                const savedAt = formatTimeFromIso(result.updatedAt);
-                const label = savedAt
-                    ? `Cloud synchronise a ${savedAt}`
-                    : 'Cloud synchronise';
-
-                setCloudSyncStatus(label, 'ok');
+                await response.json();
 
                 if (showSuccessToast) {
                     showToast('Donnees sauvegardees dans le cloud', 'success');
@@ -189,24 +166,17 @@
                 return true;
             } catch (err) {
                 console.error('Erreur de synchronisation serveur:', err);
-                setCloudSyncStatus('Erreur de synchronisation cloud', 'error');
 
                 if (showErrorToast) {
                     showToast('Echec de la sauvegarde cloud', 'error');
                 }
 
                 return false;
-            } finally {
-                setCloudSaveLoading(false);
             }
         }
 
         function saveToLocalStorage() {
             scheduleSync();
-        }
-
-        async function saveCloudNow() {
-            await syncStateToServer({ showSuccessToast: true, showErrorToast: true });
         }
 
         async function loadFromServer() {
@@ -243,29 +213,21 @@
             };
 
             if (!CLOUD_ENABLED) {
-                setCloudSyncStatus('Mode local: sauvegarde navigateur', 'idle');
                 return tryLoadFromLocal();
             }
 
             try {
                 const response = await fetch(apiUrl('/api/rocade/state'));
                 if (!response.ok) {
-                    setCloudSyncStatus('Cloud indisponible, tentative locale', 'error');
                     return tryLoadFromLocal();
                 }
 
                 const payload = await response.json();
                 if (!payload || !payload.data || !payload.uiState) {
-                    setCloudSyncStatus('Aucune sauvegarde cloud trouvee', 'idle');
                     return false;
                 }
 
                 appData = JSON.parse(payload.data);
-                const loadedAt = formatTimeFromIso(payload.updatedAt);
-                const loadedLabel = loadedAt
-                    ? `Cloud charge (${loadedAt})`
-                    : 'Cloud charge';
-                setCloudSyncStatus(loadedLabel, 'ok');
 
                 const wasNormalized = ensureCop7RequestedRows();
                 const wasAligned = ensureCop7MainLtrOrderFromDetailedRows();
@@ -288,7 +250,6 @@
                 }
             } catch (err) {
                 console.error('Erreur de chargement serveur:', err);
-                setCloudSyncStatus('Erreur de chargement cloud', 'error');
             }
 
             return tryLoadFromLocal();
@@ -1337,10 +1298,17 @@
                 .map(({ panel, pIdx }) => renderPanel(panel, rowName, pIdx, readOnly, false))
                 .join('');
 
+            const isTwoBlockInline =
+                foBlock.blockSize === 2
+                && foBlock.groupedPanels.every(({ panel }) => panel.portLayout === 'single-line-12');
+            const groupGridClass = isTwoBlockInline
+                ? 'panels-grid panels-grid-fo panel-group-grid panel-group-grid-two-inline'
+                : 'panels-grid panels-grid-fo panel-group-grid';
+
             return `
                 <div class="panel-shell panel-shell-movable panel-group-shell">
                     ${moveControlsHtml}
-                    <div class="panels-grid panels-grid-fo panel-group-grid">
+                    <div class="${groupGridClass}">
                         ${panelsHtml}
                     </div>
                 </div>
@@ -1355,7 +1323,8 @@
             const isEmptyPanel = (panel.name || '').trim().toLowerCase() === 'rocade vide';
             const canMovePanel = showMoveControls === null ? currentAisle === 'LTI' : showMoveControls;
             const panelClasses = `panel ${panel.type}${!isRJ45 && panel.ports.length === 24 ? ' panel-wide' : ''}${isEmptyPanel ? ' panel-empty' : ''}`;
-            const portsClasses = `ports ${isRJ45 ? 'rj45' : 'fiber'}${!isRJ45 && panel.ports.length === 24 ? ' fiber-24' : ''}`;
+            const isSingleLineFo12 = !isRJ45 && panel.ports.length === 12 && panel.portLayout === 'single-line-12';
+            const portsClasses = `ports ${isRJ45 ? 'rj45' : 'fiber'}${!isRJ45 && panel.ports.length === 24 ? ' fiber-24' : ''}${isSingleLineFo12 ? ' fiber-12-inline' : ''}`;
             const panelNameHtml = `<div class="panel-name${isRJ45 ? '' : ' panel-name-fo'}" onclick="startRenamePanel('${rowName}', ${pIdx}, event)">${panel.name}</div>`;
             const moveControlsHtml = canMovePanel
                 ? renderMoveControls(
@@ -1695,7 +1664,7 @@
             if (type === 'fo') {
                 if (currentAisle === 'LTI') {
                     const choice = prompt(
-                        "Format fibre :\n1 = 4 blocs de 12 ports\n2 = 1 ligne de 24 ports",
+                        "Format fibre :\n1 = 4 blocs de 12 ports\n2 = 1 ligne de 24 ports\n3 = 1 ligne de 2 blocs FO de 12 ports",
                         "1"
                     );
 
@@ -1712,6 +1681,26 @@
                         updateHeaderStats();
                         saveToLocalStorage();
                         showToast("Châssis fibre 24 ports ajouté", "success");
+                        return;
+                    }
+
+                    if (choice.trim() === '3') {
+                        const groupId = `fo12-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+                        for (let i = 0; i < 2; i++) {
+                            row.panels.push({
+                                type: 'fo',
+                                name: 'Rocade vide',
+                                ports: generatePorts(12, 'fiber'),
+                                groupId,
+                                portLayout: 'single-line-12'
+                            });
+                        }
+
+                        renderContent();
+                        updateHeaderStats();
+                        saveToLocalStorage();
+                        showToast("2 châssis FO 12 ports ajoutés sur une ligne", "success");
                         return;
                     }
                 }
